@@ -4,6 +4,8 @@ Keep staging (or any shared non-prod environment) at **0 replicas** while nobody
 
 Engineers type `/staging start 2:00` in Slack → a session is written to DynamoDB → KEDA sees an active session and scales the workloads up. When the session ends, the bot asks *"are you still working?"*; no answer (or **No**) → the session is removed → KEDA scales everything back to zero. Optionally, Grafana alerts are silenced while the environment is down.
 
+In our setup this reduced the monthly cost from $1,300 to $800 (~38%), see [Cost savings](#cost-savings).
+
 ## Architecture
 
 ```mermaid
@@ -440,6 +442,18 @@ Lambda environment variables that can be added in `lambda.tf`: `DEFAULT_SESSION_
 - Slack request signatures are **not** verified: `SKIP_SLACK_SIG` is `"true"` in `lambda.tf`, and interactive (button) requests are processed before the signature check, so setting `SKIP_SLACK_SIG = "false"` alone is not enough. Do not expose the API Gateway URL publicly without adding verification in front of all request types.
 - The API Gateway route is public; the Lambda only manages sessions (it never touches the cluster directly).
 - KEDA has read-only access to the session tables; the Lambda has write access only to its own table and read access only to the configured SSM parameters.
+
+## Cost savings
+
+Result in our usage:
+
+| | Monthly cost |
+|---|---|
+| Before scale-to-zero | $1,300 |
+| After scale-to-zero | $800 |
+| **Savings** | **$500 / month (~38%), ~$6,000 / year** |
+
+Savings depend on how many hours per day the environment is actually used and on whether the nodes scale down together with the workloads (Karpenter / Cluster Autoscaler).
 
 ## Cost
 
