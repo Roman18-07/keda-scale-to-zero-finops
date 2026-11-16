@@ -1,0 +1,78 @@
+name: terraform
+
+# Required repository/environment configuration:
+#   vars.AWS_ROLE_ARN        - IAM role trusted for GitHub OIDC (token.actions.githubusercontent.com)
+#   vars.AWS_REGION          - e.g. us-east-1
+#   secrets.TF_BACKEND_HCL   - content of backend.hcl (see terraform/backend.hcl.example)
+#   secrets.TF_VARS          - content of the *.tfvars file (see terraform/terraform.tfvars.example)
+#
+# Pull requests and pushes to main run plan only.
+# Apply is manual: Actions -> terraform -> Run workflow -> branch main, action "apply".
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Terraform action"
+        type: choice
+        options:
+          - plan
+          - apply
+        default: plan
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    environment: staging
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Write backend and variables
+        env:
+          TF_BACKEND_HCL: ${{ secrets.TF_BACKEND_HCL }}
+          TF_VARS: ${{ secrets.TF_VARS }}
+        run: |
+          printf '%s\n' "$TF_BACKEND_HCL" > backend.hcl
+          printf '%s\n' "$TF_VARS" > env.auto.tfvars
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: terraform init -input=false -backend-config=backend.hcl
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Apply
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply' && github.ref == 'refs/heads/main'
+        run: terraform apply -input=false tfplan

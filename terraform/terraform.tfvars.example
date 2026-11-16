@@ -1,0 +1,28 @@
+# Copy to e.g. inputs-staging.tfvars and fill in your values.
+# *.tfvars files are git-ignored.
+
+environment      = "staging"
+application      = "keda" # Kubernetes namespace of KEDA
+aws_region       = "us-east-1"
+eks_cluster_name = "staging-apps"
+
+# Optional: role to assume in the target account (leave empty to use current credentials)
+target_account_deploy_role = "arn:aws:iam::<ACCOUNT_ID>:role/<DEPLOY_ROLE>"
+
+enable_scale_to_zero                                 = true
+user_inactive_work_session_check_schedule_expression = "rate(2 minutes)"
+
+# Slack bot token stored in SSM Parameter Store (SecureString)
+ssm_slack_token_name = "/staging/slack-bot/token"
+ssm_slack_token_arn  = "arn:aws:ssm:us-east-1:<ACCOUNT_ID>:parameter/staging/slack-bot/token"
+slack_log_channel_id = "C0123456789"
+
+# Optional: auto-silence Grafana alerts while the environment is scaled to zero
+grafana_silence_enabled = false
+grafana_api_url         = "https://grafana.example.com"
+ssm_grafana_token_name  = "/staging/slack-bot/grafana/sa-token"
+ssm_grafana_token_arn   = "arn:aws:ssm:us-east-1:<ACCOUNT_ID>:parameter/staging/slack-bot/grafana/sa-token"
+
+extra_tags = {
+  Team = "platform"
+}

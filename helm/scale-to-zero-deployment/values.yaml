@@ -1,0 +1,43 @@
+keda:
+  # -- Render ScaledObjects
+  enabled: false
+  # -- TriggerAuthentication name (created by templates/keda-triggerauth.yaml)
+  authenticationRefName: keda-aws-trigger-auth
+  pollingInterval: 30
+  cooldownPeriod: 10
+  minReplicaCount: 0
+  maxReplicaCount: 2
+
+  # -- Replicas used while at least one session is active (fallback when target.replicas is not set)
+  minNonZeroReplicas: 1
+  # -- Per-target base replicas, e.g. { my-app: 2 }
+  baseReplicas: {}
+
+  # -- Optional overrides for scalingModifiers
+  scalingModifiers: {}
+  #  target: "1"
+  #  activationTarget: "0"
+  #  metricType: "AverageValue"
+
+  advanced:
+    scaleUpStabilization: 0
+    scaleDownStabilization: 180
+
+  dynamodb:
+    region: us-east-1
+    # -- terraform output scale_to_zero_ddb_table_name
+    tableName: "<ENV>-keda-scale-to-zero-sessions"
+    indexName: gsi_due
+    expressionAttributeNames: '{ "#k": "gsi_pk" }'
+    keyConditionExpression: "#k = :v"
+    expressionAttributeValues: '{ ":v": {"S":"PING"} }'
+    targetValue: "1"
+    activationTargetValue: "0"
+
+  # -- Workloads to scale
+  targets: []
+  #  - name: my-app
+  #    kind: Deployment
+  #    replicas: 1
+  #    minReplicaCount: 0
+  #    maxReplicaCount: 1

@@ -1,0 +1,33 @@
+keda:
+  # Inspired by https://keda.sh/docs/2.15/integrations/istio-integration/
+  # Remove podAnnotations if you don't use Istio
+  podAnnotations:
+    # -- Pod annotations for KEDA operator
+    keda:
+      traffic.sidecar.istio.io/excludeInboundPorts: "9666"
+      traffic.sidecar.istio.io/excludeOutboundPorts: "9443,6443"
+      prometheus.io/path: /metrics
+      prometheus.io/port: '8080'
+      prometheus.io/scrape: 'true'
+    # -- Pod annotations for KEDA Metrics Adapter
+    metricsAdapter:
+      traffic.sidecar.istio.io/excludeInboundPorts: "6443"
+      traffic.sidecar.istio.io/excludeOutboundPorts: "9666,9443"
+    # -- Pod annotations for KEDA Admission webhooks
+    webhooks:
+      traffic.sidecar.istio.io/excludeInboundPorts: "9443"
+      traffic.sidecar.istio.io/excludeOutboundPorts: "9666,6443"
+
+  prometheus:
+    operator:
+      enabled: true
+
+  serviceAccount:
+    operator:
+      create: true
+      # Must match the service account in the IRSA trust policy (terraform/iam.tf)
+      name: keda-operator
+      automountServiceAccountToken: true
+      annotations:
+        # terraform output keda_operator_role_arn
+        eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/<ENV>-apps-keda

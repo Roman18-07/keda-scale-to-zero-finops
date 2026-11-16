@@ -1,0 +1,9 @@
+apiVersion: v2
+name: keda
+description: KEDA wrapper chart configured for DynamoDB-driven scale-to-zero (IRSA + Istio)
+version: 1.0.0
+
+dependencies:
+  - name: keda
+    version: "2.18.3"
+    repository: "https://kedacore.github.io/charts"

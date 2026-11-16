@@ -1,0 +1,5 @@
+# Usage: terraform init -backend-config=backend.hcl
+bucket       = "<STATE_BUCKET>"
+key          = "keda-scale-to-zero/staging/terraform.tfstate"
+region       = "us-east-1"
+use_lockfile = true

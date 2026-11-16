@@ -1,0 +1,65 @@
+{{- if and .Values.keda.enabled .Values.keda.targets }}
+{{- range $t := .Values.keda.targets }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ $.Release.Name }}-{{ $t.name }}-ddb
+  namespace: {{ $.Release.Namespace }}
+  annotations:
+    autoscaling.keda.sh/paused: "false"
+spec:
+  scaleTargetRef:
+    kind: {{ $t.kind | default "Deployment" }}   # Deployment 
+    name: {{ $t.name }}
+  pollingInterval: {{ $t.pollingInterval | default $.Values.keda.pollingInterval | default 15 }}
+  cooldownPeriod: {{ $t.cooldownPeriod  | default $.Values.keda.cooldownPeriod  | default 120 }}
+  minReplicaCount: {{ $t.minReplicaCount     | default $.Values.keda.minReplicaCount | default 0 }}
+  maxReplicaCount: {{ $t.maxReplicaCount     | default $.Values.keda.maxReplicaCount | default 2 }}
+
+  {{- /* safe base calculation:
+        priority: $t.replicas -> $.Values.keda.baseReplicas[$t.name] -> $.Values.keda.minNonZeroReplicas -> 1 */ -}}
+  {{- $fallback := default 1 $.Values.keda.minNonZeroReplicas }}
+  {{- $baseReplicasMap := default (dict) $.Values.keda.baseReplicas }}
+  {{- $fromMap := index $baseReplicasMap $t.name }}
+  {{- $tRep := index $t "replicas" }}
+  {{- $base := default $fallback ( default $fromMap $tRep ) }}
+
+  {{- /* safe access to optional keda.scalingModifiers map */ -}}
+  {{- $sm := default (dict) $.Values.keda.scalingModifiers }}
+  {{- $smTarget            := default ( default "1"  (index $sm "target") )            $t.smTarget }}
+  {{- $smActivationTarget  := default ( default "0"  (index $sm "activationTarget") )  $t.smActivationTarget }}
+  {{- $smMetricType        := default ( default "AverageValue" (index $sm "metricType") ) $t.smMetricType }}
+
+  advanced:
+    {{- if $.Values.keda.advanced }}
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: {{ $.Values.keda.advanced.scaleUpStabilization   | default 0 }}
+        scaleDown:
+          stabilizationWindowSeconds: {{ $.Values.keda.advanced.scaleDownStabilization | default 180 }}
+    {{- end }}
+    scalingModifiers:
+      formula: |
+        sessions == 0 ? 0 : (sessions > {{ $base }} ? sessions : {{ $base }})
+      target: {{ $smTarget | quote }}
+      activationTarget: {{ $smActivationTarget | quote }}
+      metricType: {{ $smMetricType | quote }}
+
+  triggers:
+    - name: sessions
+      type: aws-dynamodb
+      authenticationRef:
+        name: {{ $.Values.keda.authenticationRefName | default "keda-aws-trigger-auth" }}
+      metadata:
+        awsRegion: {{ $.Values.keda.dynamodb.region | quote }}
+        tableName: {{ $.Values.keda.dynamodb.tableName | quote }}
+        indexName: {{ $.Values.keda.dynamodb.indexName | quote }}
+        expressionAttributeNames: {{ $.Values.keda.dynamodb.expressionAttributeNames | quote }}
+        keyConditionExpression: {{ $.Values.keda.dynamodb.keyConditionExpression | quote }}
+        expressionAttributeValues: {{ $.Values.keda.dynamodb.expressionAttributeValues | quote }}
+        targetValue: {{ $t.targetValue | default $.Values.keda.dynamodb.targetValue | default "1" | quote }}
+        activationTargetValue: {{ $t.activationTargetValue | default $.Values.keda.dynamodb.activationTargetValue | default "0" | quote }}
+---
+{{- end }}
+{{- end }}

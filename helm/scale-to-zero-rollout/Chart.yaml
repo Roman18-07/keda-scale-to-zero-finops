@@ -1,0 +1,4 @@
+apiVersion: v2
+name: scale-to-zero-rollout
+description: KEDA ScaledObject for an Argo Rollout with DynamoDB-driven scale-to-zero (plus optional CPU/cron triggers)
+version: 1.0.0

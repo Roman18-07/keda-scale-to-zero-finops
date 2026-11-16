@@ -1,0 +1,39 @@
+# Several Deployments of one application (JupyterHub) controlled by a separate
+# scale-to-zero instance (/jhub) with its own DynamoDB table
+keda:
+  enabled: true
+  authenticationRefName: keda-aws-trigger-auth
+  pollingInterval: 30
+  cooldownPeriod: 10
+  minReplicaCount: 0
+  maxReplicaCount: 2
+
+  advanced:
+    scaleDownStabilization: 180
+
+  dynamodb:
+    region: us-east-1
+    tableName: staging-keda-jhub-scale-to-zero-sessions
+    indexName: gsi_due
+    expressionAttributeNames: '{ "#k": "gsi_pk" }'
+    keyConditionExpression: "#k = :v"
+    expressionAttributeValues: '{ ":v": {"S":"PING"} }'
+    targetValue: "1"
+    activationTargetValue: "0"
+
+  targets:
+    - name: jupyterhub-hub
+      kind: Deployment
+      replicas: 1
+      minReplicaCount: 0
+      maxReplicaCount: 1
+    - name: jupyterhub-proxy
+      kind: Deployment
+      replicas: 1
+      minReplicaCount: 0
+      maxReplicaCount: 1
+    - name: jupyterhub-user-scheduler
+      kind: Deployment
+      replicas: 1
+      minReplicaCount: 0
+      maxReplicaCount: 1

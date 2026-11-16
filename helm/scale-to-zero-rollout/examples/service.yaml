@@ -1,0 +1,18 @@
+# Argo Rollout "core-backend" that runs only while someone has an active session
+name: core-backend
+
+autoscaler:
+  maxReplicas: 1
+  minReplicas: 0
+  horizontal:
+    triggers:
+      dynamodbTriggers:
+        - name: sessions-ddb
+          awsRegion: us-east-1
+          tableName: staging-keda-scale-to-zero-sessions
+          indexName: gsi_due
+          expressionAttributeNames: '{ "#k": "gsi_pk" }'
+          keyConditionExpression: '#k = :v'
+          expressionAttributeValues: '{ ":v": {"S":"PING"} }'
+          targetValue: '1'
+          activationTargetValue: '0'

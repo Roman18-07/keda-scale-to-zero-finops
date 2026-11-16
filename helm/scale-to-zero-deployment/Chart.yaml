@@ -1,0 +1,4 @@
+apiVersion: v2
+name: scale-to-zero-deployment
+description: KEDA TriggerAuthentication + ScaledObjects that scale Deployments/StatefulSets to zero based on DynamoDB sessions
+version: 1.0.0

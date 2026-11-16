@@ -1,0 +1,39 @@
+# -- Name of the Argo Rollout (also used as ScaledObject/HPA name and CPU container name)
+name: ""
+
+autoscaler:
+  # -- Max replicas count
+  maxReplicas: 2
+  # -- Min replicas count
+  minReplicas: 0
+  horizontal:
+    triggers:
+      cpu:
+        # -- Enable CPU horizontal autoscaler
+        enabled: true
+        # -- Average utilization of the cpu. If goes above value mentioned here - scale up
+        averageUtilization: 80
+      # -- List of cron triggers
+      cronTriggers: []
+      #  - name: cron1
+      #    timezone: America/New_York
+      #    startCron: 0 0 * * 1
+      #    endCron: 0 0 * * 6
+      #    desiredReplicas: 2
+      # -- List of dynamodb triggers
+      dynamodbTriggers: []
+      # - name: sessions-ddb
+      #   awsRegion: "us-east-1"
+      #   tableName: "<ENV>-keda-scale-to-zero-sessions"
+      #   indexName: "gsi_due"
+      #   expressionAttributeNames: '{ "#k": "gsi_pk" }'
+      #   keyConditionExpression: '#k = :v'
+      #   expressionAttributeValues: '{ ":v": {"S":"PING"} }'
+      #   targetValue: "1"
+      #   activationTargetValue: "0"
+
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 5
+      scaleDown:
+        stabilizationWindowSeconds: 300
