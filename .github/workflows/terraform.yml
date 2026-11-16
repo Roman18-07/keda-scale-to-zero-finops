@@ -1,23 +1,18 @@
-name: terraform
 
-# Required repository/environment configuration:
-#   vars.AWS_ROLE_ARN        - IAM role trusted for GitHub OIDC (token.actions.githubusercontent.com)
-#   vars.AWS_REGION          - e.g. us-east-1
-#   secrets.TF_BACKEND_HCL   - content of backend.hcl (see terraform/backend.hcl.example)
-#   secrets.TF_VARS          - content of the *.tfvars file (see terraform/terraform.tfvars.example)
-#
-# Pull requests and pushes to main run plan only.
-# Apply is manual: Actions -> terraform -> Run workflow -> branch main, action "apply".
+name: terraform
 
 on:
   pull_request:
     paths:
       - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
   workflow_dispatch:
     inputs:
       action:
@@ -29,7 +24,6 @@ on:
         default: plan
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency:
@@ -37,12 +31,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  terraform:
+  validate:
+    name: Terraform Validate
     runs-on: ubuntu-latest
-    environment: staging
+
     defaults:
       run:
         working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  deploy:
+    name: Terraform Plan / Apply
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: staging
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: terraform
+
     steps:
       - uses: actions/checkout@v4
 
@@ -61,18 +86,12 @@ jobs:
           printf '%s\n' "$TF_BACKEND_HCL" > backend.hcl
           printf '%s\n' "$TF_VARS" > env.auto.tfvars
 
-      - name: Format
-        run: terraform fmt -check -recursive
-
-      - name: Init
+      - name: Terraform Init
         run: terraform init -input=false -backend-config=backend.hcl
 
-      - name: Validate
-        run: terraform validate
-
-      - name: Plan
+      - name: Terraform Plan
         run: terraform plan -input=false -out=tfplan
 
-      - name: Apply
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply' && github.ref == 'refs/heads/main'
+      - name: Terraform Apply
+        if: inputs.action == 'apply'
         run: terraform apply -input=false tfplan
