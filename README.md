@@ -1,10 +1,40 @@
 # KEDA Scale-to-Zero for non-production Kubernetes environments
 
+## Overview & Problem
+
 Keep staging (or any shared non-prod environment) at **0 replicas** while nobody uses it, and bring it up on demand from Slack.
 
 Engineers type `/staging start 2:00` in Slack → a session is written to DynamoDB → KEDA sees an active session and scales the workloads up. When the session ends, the bot asks *"are you still working?"*; no answer (or **No**) → the session is removed → KEDA scales everything back to zero. Optionally, Grafana alerts are silenced while the environment is down.
 
+**The problem.** A shared staging environment usually runs 24/7, while engineers use it only during working hours. Nights, weekends and idle days are paid in full: pods keep their CPU/memory requests reserved, so the nodes under them cannot be removed. Manual shutdown does not work in practice: someone forgets to scale back down, or the environment is needed again in an hour.
+
+**The solution.** Staging runs only while at least one engineer has an active session. Sessions are started from Slack and end automatically when nobody confirms they are still working.
+
 In our setup this reduced the monthly cost from $1,300 to $800 (~38%), see [Cost savings](#cost-savings).
+
+## Key Benefits & Cost Savings
+
+- **Pay only for used hours** – workloads stay at 0 replicas between sessions; with Karpenter / Cluster Autoscaler the nodes are removed too.
+- **Self-service from Slack** – `start`, `stop`, `status` without `kubectl` or cluster access.
+- **No forgotten environments** – at the end of a session the bot asks *"are you still working?"*; no answer → scale to zero.
+- **No alert noise while down** – optional Grafana silence when the last session ends.
+- **Small footprint** – serverless control plane (Lambda, DynamoDB, API Gateway, EventBridge); applications only need a ScaledObject, no code changes.
+
+### Cost savings
+
+Result in our usage:
+
+| | Monthly cost |
+|---|---|
+| Before scale-to-zero | $1,300 |
+| After scale-to-zero | $800 |
+| **Savings** | **$500 / month (~38%), ~$6,000 / year** |
+
+Savings depend on how many hours per day the environment is actually used and on whether the nodes scale down together with the workloads (Karpenter / Cluster Autoscaler).
+
+### Running cost
+
+Everything except the cluster is serverless and pay-per-request: DynamoDB on-demand, Lambda invocations every few minutes, API Gateway HTTP API, CloudWatch Logs with 1-day retention. Cluster workloads (and, with Karpenter/Cluster Autoscaler, the nodes) are off outside working sessions.
 
 ## Architecture
 
@@ -32,18 +62,25 @@ flowchart LR
 | ScaledObjects for Deployments | `helm/scale-to-zero-deployment` | Any number of Deployments/StatefulSets per release |
 | ScaledObject for Argo Rollouts | `helm/scale-to-zero-rollout` | Rollout-based services (CPU/cron triggers can be combined) |
 
-### How scaling works
+### Repository layout
 
-Every active session has `gsi_pk = "PING"`. KEDA's `aws-dynamodb` scaler counts items in index `gsi_due` with `gsi_pk = PING`:
-
-```yaml
-scalingModifiers:
-  formula: |
-    sessions == 0 ? 0 : (sessions > 1 ? sessions : 1)
+```
+.
+├── .github/workflows/terraform.yml   # plan on PR, apply on main (GitHub OIDC)
+├── terraform/                        # AWS side (Terraform / OpenTofu)
+│   ├── scale-to-zero.tf              # main instance (/staging)
+│   ├── scale-to-zero-jhub.tf         # second, independent instance (/jhub)
+│   ├── iam.tf                        # IRSA role + DynamoDB read policy for KEDA
+│   ├── terraform.tfvars.example
+│   ├── backend.hcl.example
+│   └── modules/scale_to_zero/        # Lambda, DynamoDB, API Gateway, EventBridge, IAM, logs
+└── helm/
+    ├── keda/                         # KEDA operator
+    ├── scale-to-zero-deployment/     # ScaledObjects for Deployments/StatefulSets
+    └── scale-to-zero-rollout/        # ScaledObject for an Argo Rollout
 ```
 
-- `0` active sessions → 0 replicas.
-- `>= 1` active sessions → base replicas (configurable per target).
+## How It Works
 
 ### Session lifecycle
 
@@ -88,6 +125,19 @@ sequenceDiagram
 4. No answer within the grace period – DM is updated to *"Session expired"*, a message is posted to the log channel, the session is deleted.
 5. When the last session is deleted, a Grafana silence for all alerts is created (optional).
 
+### How scaling works
+
+Every active session has `gsi_pk = "PING"`. KEDA's `aws-dynamodb` scaler counts items in index `gsi_due` with `gsi_pk = PING`:
+
+```yaml
+scalingModifiers:
+  formula: |
+    sessions == 0 ? 0 : (sessions > 1 ? sessions : 1)
+```
+
+- `0` active sessions → 0 replicas.
+- `>= 1` active sessions → base replicas (configurable per target).
+
 ### Slack commands
 
 | Command | Action |
@@ -100,25 +150,89 @@ sequenceDiagram
 
 The command name and label are configurable (`slash_command`, `session_label`), so you can run several independent instances, e.g. `/staging` for the whole environment and `/jhub` for JupyterHub only (see `terraform/scale-to-zero-jhub.tf`).
 
-## Repository layout
+## Technical Design
+
+### Lambda
+
+One function (`lambda_handler`, Python 3.13, standard library + `boto3` only) serves three kinds of requests:
+
+| Source | How it is detected | What it does |
+|---|---|---|
+| Slack slash command via API Gateway | Form body with `text` and `user_id` | `start [HH:MM]`, `stop`, `status`, `purge` |
+| Slack button via API Gateway | Form body with `payload=` | `confirm_yes` extends the session, `confirm_no` deletes it |
+| EventBridge schedule | `source = aws.events` | Sends Yes/No DMs for due sessions, deletes unanswered ones |
+
+The Lambda only reads/writes DynamoDB and calls the Slack and Grafana APIs. It has no Kubernetes access.
+
+### DynamoDB
+
+Table `<env>-<app>-scale-to-zero-sessions`, on-demand billing, point-in-time recovery, TTL on `expires_at`.
+
+| Key / index | Attributes | Used by |
+|---|---|---|
+| Primary key | `user_id` (hash), `session_id` (range) | Lambda: one session per user |
+| GSI `gsi_due` | `gsi_pk` (hash), `next_ping_at` (range) | KEDA: count of `gsi_pk = PING`; Lambda: sessions due for a ping |
+| GSI `gsi_expire` | `gsi_pk` (hash), `expires_at` (range) | Lambda: sessions whose grace period has ended |
+
+Other session attributes: `ping_sent`, `channel_id`, `message_ts`, `last_button_ts`, `started_at`, `session_seconds`. The Grafana silence ID is stored in the same table as a separate item without `gsi_pk`, so KEDA does not count it.
+
+### How KEDA authenticates to AWS (IRSA)
+
+IRSA (IAM Roles for Service Accounts) lets a Kubernetes pod use an IAM role without static AWS keys. Here only the **KEDA operator** needs AWS access, to read the sessions table; your applications don't need any AWS permissions, and the Lambda never talks to the cluster.
 
 ```
-.
-├── .github/workflows/terraform.yml   # plan on PR, apply on main (GitHub OIDC)
-├── terraform/                        # AWS side (Terraform / OpenTofu)
-│   ├── scale-to-zero.tf              # main instance (/staging)
-│   ├── scale-to-zero-jhub.tf         # second, independent instance (/jhub)
-│   ├── iam.tf                        # IRSA role + DynamoDB read policy for KEDA
-│   ├── terraform.tfvars.example
-│   ├── backend.hcl.example
-│   └── modules/scale_to_zero/        # Lambda, DynamoDB, API Gateway, EventBridge, IAM, logs
-└── helm/
-    ├── keda/                         # KEDA operator
-    ├── scale-to-zero-deployment/     # ScaledObjects for Deployments/StatefulSets
-    └── scale-to-zero-rollout/        # ScaledObject for an Argo Rollout
+terraform/iam.tf      IAM role <env>-apps-<application>
+                        trust:  OIDC provider of the EKS cluster
+                        sub  =  system:serviceaccount:<application>:keda-operator
+                        policy: dynamodb:Query/Scan/GetItem/DescribeTable on session tables
+        │  output keda_operator_role_arn
+        ▼
+helm/keda             ServiceAccount keda-operator
+                        annotation eks.amazonaws.com/role-arn: <role ARN>
+        │  EKS injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE into the pod
+        ▼
+TriggerAuthentication podIdentity: { provider: aws, identityOwner: keda }
+        │  the scaler uses the keda-operator identity
+        ▼
+ScaledObject          aws-dynamodb trigger: count items in gsi_due where gsi_pk = PING
 ```
 
-## Prerequisites
+Things that must match:
+
+| Where | Value | Must equal |
+|---|---|---|
+| `application` (tfvars) | `keda` | KEDA namespace |
+| `terraform/iam.tf` `sub` condition | `keda-operator` | `keda.serviceAccount.operator.name` in `helm/keda/values.yaml` |
+| SA annotation | role ARN | `terraform output keda_operator_role_arn` |
+| `dynamodb.tableName` / `region` in values | table name, region | Terraform outputs, `aws_region` |
+| `authenticationRef` / `authenticationRefName` | `keda-aws-trigger-auth` | `TriggerAuthentication` name in the same namespace |
+
+### IAM permissions
+
+| Identity | Permissions |
+|---|---|
+| KEDA operator (IRSA, `terraform/iam.tf`) | `dynamodb:DescribeTable`, `Query`, `Scan`, `GetItem` on the session tables |
+| Lambda (`terraform/modules/scale_to_zero/iam.tf`) | Read/write on its own table, `ssm:GetParameter*` on the configured parameters, CloudWatch Logs |
+
+### Configuration reference
+
+Module `terraform/modules/scale_to_zero`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `environment`, `application` | – | Resource name prefix `<environment>-<application>-scale-to-zero` |
+| `ssm_slack_token_name` / `_arn` | – | Slack bot token in SSM |
+| `slack_log_channel_id` | `""` | Channel for start/stop/extend log messages |
+| `user_inactive_work_session_check_schedule_expression` | – | EventBridge schedule, e.g. `rate(2 minutes)` |
+| `session_label` / `slash_command` | `staging` / `/staging` | Text used in messages and help |
+| `session_ttl_sec` / `ping_grace_sec` | `3600` / `300` | Passed to the Lambda environment (not read by the current code, see below) |
+| `grafana_*` | disabled | Auto-silence settings |
+
+Lambda environment variables that can be added in `lambda.tf`: `DEFAULT_SESSION_HOURS` (1), `MAX_SESSION_HOURS` (8), `PING_CONFIRMATION_MINUTES` (5).
+
+## Quick Start & Deployment
+
+### Prerequisites
 
 - AWS account with an EKS cluster and an IAM OIDC provider for it (IRSA), see step 0.
 - `aws` CLI, `kubectl`, `helm`, Terraform >= 1.6 or OpenTofu (AWS provider >= 6.6).
@@ -126,8 +240,6 @@ The command name and label are configurable (`slash_command`, `session_label`), 
 - KEDA (installed via `helm/keda` or your own installation with IRSA on `keda-operator`).
 - A Slack workspace where you can create an app.
 - Optional: Argo Rollouts (for `helm/scale-to-zero-rollout`), Grafana with Alertmanager API (for auto-silence).
-
-## Setup
 
 ### 0. Cluster access and OIDC provider
 
@@ -331,7 +443,7 @@ When the last session ends, the Lambda creates a silence matching `alertname=~".
 ```shell
 TABLE=$(terraform -chdir=terraform output -raw scale_to_zero_ddb_table_name)
 
-# 1. IRSA is wired (see the next section for details)
+# 1. IRSA is wired (see Technical Design for details)
 kubectl -n keda get sa keda-operator -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'; echo
 kubectl -n keda get pod -l app=keda-operator -o yaml | grep -A1 AWS_ROLE_ARN
 
@@ -348,59 +460,7 @@ kubectl -n mailpit get deploy -w    # 0 -> 1 within pollingInterval (30s)
 # 4. /staging stop -> back to 0 after cooldownPeriod + scale-down stabilization (~3 min)
 ```
 
-## How KEDA authenticates to AWS (IRSA)
-
-IRSA (IAM Roles for Service Accounts) lets a Kubernetes pod use an IAM role without static AWS keys. Here only the **KEDA operator** needs AWS access, to read the sessions table; your applications don't need any AWS permissions, and the Lambda never talks to the cluster.
-
-```
-terraform/iam.tf      IAM role <env>-apps-<application>
-                        trust:  OIDC provider of the EKS cluster
-                        sub  =  system:serviceaccount:<application>:keda-operator
-                        policy: dynamodb:Query/Scan/GetItem/DescribeTable on session tables
-        │  output keda_operator_role_arn
-        ▼
-helm/keda             ServiceAccount keda-operator
-                        annotation eks.amazonaws.com/role-arn: <role ARN>
-        │  EKS injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE into the pod
-        ▼
-TriggerAuthentication podIdentity: { provider: aws, identityOwner: keda }
-        │  the scaler uses the keda-operator identity
-        ▼
-ScaledObject          aws-dynamodb trigger: count items in gsi_due where gsi_pk = PING
-```
-
-Things that must match:
-
-| Where | Value | Must equal |
-|---|---|---|
-| `application` (tfvars) | `keda` | KEDA namespace |
-| `terraform/iam.tf` `sub` condition | `keda-operator` | `keda.serviceAccount.operator.name` in `helm/keda/values.yaml` |
-| SA annotation | role ARN | `terraform output keda_operator_role_arn` |
-| `dynamodb.tableName` / `region` in values | table name, region | Terraform outputs, `aws_region` |
-| `authenticationRef` / `authenticationRefName` | `keda-aws-trigger-auth` | `TriggerAuthentication` name in the same namespace |
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `kubectl`: `Unauthorized` / `You must be logged in` | No cluster access for your IAM identity | Step 0: access entry, `aws eks update-kubeconfig` |
-| `terraform plan`: `no matching IAM OIDC provider` | OIDC provider not created | Step 0: `eksctl utils associate-iam-oidc-provider` |
-| ScaledObject event: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Namespace / service account differs from the trust policy | Align `application` and SA name, re-apply Terraform |
-| No `AWS_ROLE_ARN` in the keda-operator pod | Annotation missing or pod not restarted | Annotate SA, `kubectl -n keda rollout restart deploy/keda-operator` |
-| `AccessDeniedException ... dynamodb:Query` | `tableName` points to a table not covered by the policy | Use the table name from Terraform outputs |
-| `ResourceNotFoundException` | Wrong `region` or table name | Check `dynamodb.region` / `tableName` |
-| `TriggerAuthentication ... not found` | Missing in the workload namespace | Install the chart (it renders `TriggerAuthentication`) in that namespace |
-| Workload scales up and immediately back (GitOps) | Argo CD restores `spec.replicas` | `ignoreDifferences` on `/spec/replicas` (step 5) |
-| Never scales to zero | Session still exists, or `minReplicaCount` > 0 | `/staging status`, `/staging purge`; set `minReplicaCount: 0` |
-| Slack command times out / no DM | Wrong Request URL or missing bot scopes | Step 3; check Lambda logs `/aws/lambda/<env>-<app>-scale-to-zero` |
-
-Operator logs:
-
-```shell
-kubectl -n keda logs deploy/keda-operator | grep -iE 'dynamodb|accessdenied|webidentity|error'
-```
-
-## CI/CD
+### CI/CD
 
 ```mermaid
 flowchart LR
@@ -421,41 +481,41 @@ Configure:
 - `secrets.TF_BACKEND_HCL` – content of `backend.hcl`;
 - `secrets.TF_VARS` – content of the tfvars file.
 
-## Configuration reference
+## Security, Limitations & Troubleshooting
 
-Module `terraform/modules/scale_to_zero`:
-
-| Variable | Default | Description |
-|---|---|---|
-| `environment`, `application` | – | Resource name prefix `<environment>-<application>-scale-to-zero` |
-| `ssm_slack_token_name` / `_arn` | – | Slack bot token in SSM |
-| `slack_log_channel_id` | `""` | Channel for start/stop/extend log messages |
-| `user_inactive_work_session_check_schedule_expression` | – | EventBridge schedule, e.g. `rate(2 minutes)` |
-| `session_label` / `slash_command` | `staging` / `/staging` | Text used in messages and help |
-| `session_ttl_sec` / `ping_grace_sec` | `3600` / `300` | Passed to the Lambda environment (not read by the current code, see below) |
-| `grafana_*` | disabled | Auto-silence settings |
-
-Lambda environment variables that can be added in `lambda.tf`: `DEFAULT_SESSION_HOURS` (1), `MAX_SESSION_HOURS` (8), `PING_CONFIRMATION_MINUTES` (5).
-
-## Security notes
+### Security notes
 
 - Slack request signatures are **not** verified: `SKIP_SLACK_SIG` is `"true"` in `lambda.tf`, and interactive (button) requests are processed before the signature check, so setting `SKIP_SLACK_SIG = "false"` alone is not enough. Do not expose the API Gateway URL publicly without adding verification in front of all request types.
 - The API Gateway route is public; the Lambda only manages sessions (it never touches the cluster directly).
 - KEDA has read-only access to the session tables; the Lambda has write access only to its own table and read access only to the configured SSM parameters.
 
-## Cost savings
+### Limitations
 
-Result in our usage:
+- Slack signature verification is disabled (see above).
+- Slack allows one Interactivity URL per app, so each instance (`/staging`, `/jhub`) needs its own Slack app for independent Yes/No handling.
+- `/staging purge` deletes the sessions of **all** users.
+- `session_ttl_sec` and `ping_grace_sec` are not read by the Lambda; use `DEFAULT_SESSION_HOURS`, `MAX_SESSION_HOURS`, `PING_CONFIRMATION_MINUTES` instead.
+- Scale-up is not instant: up to the EventBridge interval for pings and up to `pollingInterval` (30s) plus pod start time for workloads.
+- With GitOps, `spec.replicas` must be ignored, otherwise Argo CD fights KEDA (step 5).
+- `terraform validate` reports deprecated GSI arguments in `dynamodb.tf` with AWS provider 6.x; the configuration still works.
 
-| | Monthly cost |
-|---|---|
-| Before scale-to-zero | $1,300 |
-| After scale-to-zero | $800 |
-| **Savings** | **$500 / month (~38%), ~$6,000 / year** |
+### Troubleshooting
 
-Savings depend on how many hours per day the environment is actually used and on whether the nodes scale down together with the workloads (Karpenter / Cluster Autoscaler).
+| Symptom | Cause | Fix |
+|---|---|---|
+| `kubectl`: `Unauthorized` / `You must be logged in` | No cluster access for your IAM identity | Step 0: access entry, `aws eks update-kubeconfig` |
+| `terraform plan`: `no matching IAM OIDC provider` | OIDC provider not created | Step 0: `eksctl utils associate-iam-oidc-provider` |
+| ScaledObject event: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Namespace / service account differs from the trust policy | Align `application` and SA name, re-apply Terraform |
+| No `AWS_ROLE_ARN` in the keda-operator pod | Annotation missing or pod not restarted | Annotate SA, `kubectl -n keda rollout restart deploy/keda-operator` |
+| `AccessDeniedException ... dynamodb:Query` | `tableName` points to a table not covered by the policy | Use the table name from Terraform outputs |
+| `ResourceNotFoundException` | Wrong `region` or table name | Check `dynamodb.region` / `tableName` |
+| `TriggerAuthentication ... not found` | Missing in the workload namespace | Install the chart (it renders `TriggerAuthentication`) in that namespace |
+| Workload scales up and immediately back (GitOps) | Argo CD restores `spec.replicas` | `ignoreDifferences` on `/spec/replicas` (step 5) |
+| Never scales to zero | Session still exists, or `minReplicaCount` > 0 | `/staging status`, `/staging purge`; set `minReplicaCount: 0` |
+| Slack command times out / no DM | Wrong Request URL or missing bot scopes | Step 3; check Lambda logs `/aws/lambda/<env>-<app>-scale-to-zero` |
 
-## Cost
+Operator logs:
 
-Everything except the cluster is serverless and pay-per-request: DynamoDB on-demand, Lambda invocations every few minutes, API Gateway HTTP API, CloudWatch Logs with 1-day retention. Cluster workloads (and, with Karpenter/Cluster Autoscaler, the nodes) are off outside working sessions.
-
+```shell
+kubectl -n keda logs deploy/keda-operator | grep -iE 'dynamodb|accessdenied|webidentity|error'
+```
